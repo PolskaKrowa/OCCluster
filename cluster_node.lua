@@ -98,6 +98,13 @@ local lastHeartbeatRecv = 0
 local taskCounter = 0
 local jobs = {} -- master-side bookkeeping: [taskId] = {expected, got, results, requester, jobName, startTime}
 
+-- ASSIGNs that arrived while this node was already busy executing a job.
+-- They cannot be run inline (the worker is synchronous and single-tasking),
+-- so they are queued here and re-dispatched from the main loop once the
+-- current job returns. The master-side scheduler is informed so it can
+-- re-roll the job without the dropped rank.
+local pendingAssigns = {}
+
 -------------------------------------------------------------------------
 -- Small helpers
 -------------------------------------------------------------------------
@@ -202,13 +209,33 @@ local function buildTaskAPI(taskId, rank, size, ranks, reportTo)
   local api = {rank = rank, size = size, taskId = taskId}
   local resultSent = false
 
+  -- Per-task inbox of TASK_MSG messages that arrived for this task but
+  -- didn't match the specific (fromRank, tag) the caller was waiting for.
+  -- Without this, an out-of-order message (e.g. rank 2's BARRIER reaching
+  -- rank 0 while rank 0 is still waiting on rank 1) would be dispatched
+  -- to handlers.TASK_MSG (a no-op) and silently dropped, hanging the job.
+  local inbox = {}
+
   local function rawSend(toRank, tag, payload)
     local addr = ranks[toRank]
     if not addr then error("cluster.send: no such rank " .. tostring(toRank)) end
     send(addr, {type = "TASK_MSG", taskId = taskId, fromRank = rank, toRank = toRank, tag = tag, payload = payload})
   end
 
+  local function matches(msg, fromRank, tag)
+    return (fromRank == nil or msg.fromRank == fromRank)
+       and (tag == nil or msg.tag == tag)
+  end
+
   local function rawRecv(fromRank, tag, timeout)
+    -- First, scan the inbox for anything that already satisfies this wait.
+    for i, m in ipairs(inbox) do
+      if matches(m, fromRank, tag) then
+        table.remove(inbox, i)
+        return m.payload, m.fromRank
+      end
+    end
+
     timeout = timeout or 30
     local deadline = computer.uptime() + timeout
     while true do
@@ -218,16 +245,31 @@ local function buildTaskAPI(taskId, rank, size, ranks, reportTo)
       if e == "modem_message" and port == PORT then
         local ok, msg = pcall(serialization.unserialize, data)
         if ok and type(msg) == "table" then
-          if msg.type == "TASK_MSG" and msg.taskId == taskId
-             and (fromRank == nil or msg.fromRank == fromRank)
-             and (tag == nil or msg.tag == tag) then
-            return msg.payload, msg.fromRank
+          if msg.type == "TASK_MSG" and msg.taskId == taskId then
+            if matches(msg, fromRank, tag) then
+              return msg.payload, msg.fromRank
+            else
+              -- Belongs to this task but not what we're waiting for right
+              -- now. Queue it so a later rawRecv() with different filters
+              -- can pick it up. Previously this was dropped, which broke
+              -- barrier/gather any time messages arrived out of order.
+              table.insert(inbox, msg)
+            end
           else
-            -- Not meant for this wait - let normal handling deal with it
-            -- (heartbeats, other tasks' messages, etc.) so the cluster
-            -- keeps ticking over while this job blocks on I/O.
-            local h = handlers[msg.type]
-            if h then h(msg) end
+            -- Not a TASK_MSG for this task. Dispatch to its handler so
+            -- the cluster keeps ticking (heartbeats, etc.) while this
+            -- job blocks on I/O.
+            -- EXCEPTION: never dispatch ASSIGN here. While a worker is
+            -- already running a job it cannot start another one
+            -- synchronously without re-entering executeTask and
+            -- corrupting the in-flight job's state. Stash the late
+            -- ASSIGN so the main loop can deal with it after we return.
+            if msg.type == "ASSIGN" then
+              table.insert(pendingAssigns, msg)
+            else
+              local h = handlers[msg.type]
+              if h then h(msg) end
+            end
           end
         end
       end
@@ -588,6 +630,15 @@ while true do
       inputBuffer = inputBuffer .. unicode.char(char)
       term.write(unicode.char(char))
     end
+  end
+
+  -- Drain any ASSIGNs that were queued while we were busy running a job.
+  -- We do this after event handling and outside any handler so that the
+  -- queued job runs cleanly in an idle state, the same way a freshly
+  -- arrived ASSIGN would.
+  while #pendingAssigns > 0 do
+    local queued = table.remove(pendingAssigns, 1)
+    if handlers.ASSIGN then handlers.ASSIGN(queued) end
   end
 
   local now = computer.uptime()
