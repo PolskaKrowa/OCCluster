@@ -378,6 +378,13 @@ handlers.SUBMIT = function(msg)
   local taskId = newTaskId()
   jobs[taskId] = {expected = n, got = 0, results = {}, requester = msg.from, jobName = msg.jobName, startTime = now}
 
+  -- Send ASSIGN to every *remote* node first and only run our own (self)
+  -- task last. Running a self-task inline blocks this whole event loop
+  -- (including heartbeats) until it finishes, so if it ran first the
+  -- other nodes would never even receive their ASSIGN until we were
+  -- done - and might time out on us and start a new election in the
+  -- meantime. Dispatching remotely first avoids that entirely.
+  local selfAssign = nil
   for rank, addr in pairs(ranks) do
     local assignMsg = {
       type = "ASSIGN", taskId = taskId, rank = rank, size = n,
@@ -385,7 +392,7 @@ handlers.SUBMIT = function(msg)
     }
     if addr == ID then
       assignMsg.from = ID
-      executeTask(assignMsg)
+      selfAssign = assignMsg
     else
       send(addr, assignMsg)
     end
@@ -393,6 +400,10 @@ handlers.SUBMIT = function(msg)
 
   send(msg.from, {type = "SUBMIT_ACK", ok = true, taskId = taskId, size = n})
   log("Dispatched job '%s' as task %s across %d node(s)", tostring(msg.jobName), taskId:sub(1, 12), n)
+
+  if selfAssign then
+    executeTask(selfAssign)
+  end
 end
 
 handlers.SUBMIT_ACK = function(msg)
