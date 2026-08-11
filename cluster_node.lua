@@ -59,7 +59,7 @@ for i = 1, #args do
 end
 
 local PORT         = cfg.port
-local ID           = computer.address()
+local ID           = modem.address
 local NAME         = cfg.name or ID:sub(1, 8)
 local MY_PRIORITY  = cfg.priority
 
