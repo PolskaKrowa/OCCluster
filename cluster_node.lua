@@ -27,6 +27,7 @@ if not component.isAvailable("modem") then
   return
 end
 local modem = component.modem
+local gpu   = component.gpu
 
 -------------------------------------------------------------------------
 -- Config
@@ -106,11 +107,78 @@ local jobs = {} -- master-side bookkeeping: [taskId] = {expected, got, results, 
 local pendingAssigns = {}
 
 -------------------------------------------------------------------------
+-- Colour / display helpers
+--
+-- All colour is optional: on a tier 1 (monochrome) GPU every helper here
+-- becomes a no-op and the program falls back to plain text, exactly as
+-- before. On tier 2/3 we theme log levels, tables, and a small live
+-- status bar pinned to the top of the screen.
+-------------------------------------------------------------------------
+
+local hasColor = gpu.getDepth() > 1
+
+local defaultFg, defaultFgPalette = gpu.getForeground()
+local defaultBg, defaultBgPalette = gpu.getBackground()
+
+local COLORS = {
+  text    = 0xE6E6E6,
+  muted   = 0x6C7086,
+  accent  = 0xBD93F9,
+  master  = 0x50FA7B,
+  worker  = 0x8BE9FD,
+  ok      = 0x50FA7B,
+  warn    = 0xF1FA8C,
+  error   = 0xFF5555,
+  header  = 0xF8F8F2,
+  bar_bg  = 0x21222C,
+  bar_fg  = 0xF8F8F2,
+}
+
+local RANK_PALETTE = {0x8BE9FD, 0xFFB86C, 0xFF79C6, 0x50FA7B, 0xBD93F9, 0xF1FA8C}
+
+local function rankColor(rank)
+  return RANK_PALETTE[(rank % #RANK_PALETTE) + 1]
+end
+
+local function fg(color)
+  if hasColor and color then gpu.setForeground(color) end
+end
+
+local function resetColors()
+  if not hasColor then return end
+  gpu.setForeground(defaultFg, defaultFgPalette)
+  gpu.setBackground(defaultBg, defaultBgPalette)
+end
+
+local function printColor(color, msg)
+  fg(color)
+  print(msg)
+  resetColors()
+end
+
+local function printOk(msg)   printColor(COLORS.ok, msg) end
+local function printWarn(msg) printColor(COLORS.warn, msg) end
+local function printErr(msg)  printColor(COLORS.error, msg) end
+
+-------------------------------------------------------------------------
 -- Small helpers
 -------------------------------------------------------------------------
 
-local function log(fmt, ...)
-  print(("[%s] " .. fmt):format(os.date("%H:%M:%S"), ...))
+local LEVEL_COLOR = {
+  info   = COLORS.text,
+  ok     = COLORS.ok,
+  warn   = COLORS.warn,
+  error  = COLORS.error,
+  master = COLORS.master,
+}
+
+local function log(level, fmt, ...)
+  local msg = fmt:format(...)
+  fg(COLORS.muted)
+  term.write(("[%s] "):format(os.date("%H:%M:%S")))
+  fg(LEVEL_COLOR[level] or COLORS.text)
+  print(msg)
+  resetColors()
 end
 
 local function send(address, msg)
@@ -161,11 +229,11 @@ local function considerMasterClaim(fromAddr, claimedMaster, claimedPriority)
     pendingCoordinatorDeadline = nil
 
     if wasMaster and role == "worker" then
-      log("Stepping down: higher-priority master %s (p=%d) found", claimedMaster:sub(1, 8), claimedPriority)
+      log("warn", "Stepping down: higher-priority master %s (p=%d) found", claimedMaster:sub(1, 8), claimedPriority)
     elseif not wasMaster and role == "master" then
-      log("This node is now MASTER (priority %d)", MY_PRIORITY)
+      log("master", "This node is now MASTER (priority %d)", MY_PRIORITY)
     elseif role == "worker" then
-      log("Master is %s (priority %d)", claimedMaster:sub(1, 8), claimedPriority)
+      log("info", "Master is %s (priority %d)", claimedMaster:sub(1, 8), claimedPriority)
     end
   elseif claimedMaster ~= masterAddress then
     -- Someone is claiming mastership but we already know a better master.
@@ -184,7 +252,7 @@ local function startElection()
     bestSeen = {priority = -math.huge, address = ""}
   end
   broadcastMsg({type = "ELECTION", priority = MY_PRIORITY})
-  log("Starting master election...")
+  log("warn", "Starting master election...")
 end
 
 -------------------------------------------------------------------------
@@ -334,7 +402,7 @@ local function executeTask(msg)
   local taskId, rank, size, ranks, source = msg.taskId, msg.rank, msg.size, msg.ranks, msg.source
   local reportTo = msg.from
 
-  log("Running task %s (job=%s) as rank %d/%d", taskId:sub(1, 12), tostring(msg.jobName), rank, size)
+  log("info", "Running task %s (job=%s) as rank %d/%d", taskId:sub(1, 12), tostring(msg.jobName), rank, size)
 
   local api, resultSent = buildTaskAPI(taskId, rank, size, ranks, reportTo)
 
@@ -354,7 +422,7 @@ local function executeTask(msg)
     })
   end
 
-  log("Task %s finished (rank %d) ok=%s", taskId:sub(1, 12), rank, tostring(ok))
+  log(ok and "ok" or "error", "Task %s finished (rank %d) ok=%s", taskId:sub(1, 12), rank, tostring(ok))
 end
 
 -------------------------------------------------------------------------
@@ -441,7 +509,7 @@ handlers.SUBMIT = function(msg)
   end
 
   send(msg.from, {type = "SUBMIT_ACK", ok = true, taskId = taskId, size = n})
-  log("Dispatched job '%s' as task %s across %d node(s)", tostring(msg.jobName), taskId:sub(1, 12), n)
+  log("ok", "Dispatched job '%s' as task %s across %d node(s)", tostring(msg.jobName), taskId:sub(1, 12), n)
 
   if selfAssign then
     executeTask(selfAssign)
@@ -450,25 +518,34 @@ end
 
 handlers.SUBMIT_ACK = function(msg)
   if msg.ok then
-    log("Job accepted: taskId=%s size=%d", msg.taskId:sub(1, 12), msg.size)
+    log("ok", "Job accepted: taskId=%s size=%d", msg.taskId:sub(1, 12), msg.size)
   else
-    log("Job rejected: %s", tostring(msg.error))
+    log("error", "Job rejected: %s", tostring(msg.error))
   end
 end
 
 handlers.SUBMIT_RESULT = function(msg)
+  fg(COLORS.accent)
   print(("Job '%s' complete in %.2fs (task %s):"):format(tostring(msg.jobName), msg.elapsed, msg.taskId:sub(1, 8)))
+  resetColors()
   for rank, r in pairs(msg.results) do
     if r.ok then
+      fg(COLORS.ok)
       print(("  rank %d -> %s"):format(rank, tostring(r.result)))
     else
+      fg(COLORS.error)
       print(("  rank %d FAILED: %s"):format(rank, tostring(r.error)))
     end
+    resetColors()
   end
 end
 
 handlers.LOG = function(msg)
-  print(("  [%s][rank %d] %s"):format(msg.taskId:sub(1, 8), msg.rank, msg.message))
+  fg(rankColor(msg.rank))
+  term.write(("  [%s][rank %d] "):format(msg.taskId:sub(1, 8), msg.rank))
+  fg(COLORS.text)
+  print(msg.message)
+  resetColors()
 end
 
 handlers.TASK_DONE = function(msg)
@@ -511,6 +588,45 @@ local function readFile(path)
   return data
 end
 
+-- Draws a simple box-drawn table. `rows` is a list of arrays of cell
+-- strings (indices 1..#headers); a row may also set `rowColor` to
+-- highlight the whole line (used to pick out the current master).
+local function drawTable(headers, rows)
+  local widths = {}
+  for i, h in ipairs(headers) do widths[i] = unicode.len(h) end
+  for _, row in ipairs(rows) do
+    for i = 1, #headers do
+      widths[i] = math.max(widths[i], unicode.len(tostring(row[i] or "")))
+    end
+  end
+
+  local function border(l, m, r)
+    local parts = {}
+    for _, w in ipairs(widths) do parts[#parts + 1] = string.rep("\xe2\x94\x80", w + 2) end
+    print(l .. table.concat(parts, m) .. r)
+  end
+
+  local function rowLine(cells, color)
+    local out = {}
+    for i, w in ipairs(widths) do
+      local text = tostring(cells[i] or "")
+      out[#out + 1] = " " .. text .. string.rep(" ", math.max(0, w - unicode.len(text))) .. " "
+    end
+    local line = "\xe2\x94\x82" .. table.concat(out, "\xe2\x94\x82") .. "\xe2\x94\x82"
+    if color then fg(color) end
+    print(line)
+    if color then resetColors() end
+  end
+
+  border("\xe2\x94\x8c", "\xe2\x94\xac", "\xe2\x94\x90")
+  rowLine(headers, COLORS.header)
+  border("\xe2\x94\x9c", "\xe2\x94\xbc", "\xe2\x94\xa4")
+  for _, row in ipairs(rows) do
+    rowLine(row, row.rowColor)
+  end
+  border("\xe2\x94\x94", "\xe2\x94\xb4", "\xe2\x94\x98")
+end
+
 local function handleCommand(line)
   line = line:gsub("^%s+", ""):gsub("%s+$", "")
   if line == "" then return end
@@ -521,7 +637,7 @@ local function handleCommand(line)
 
   if cmd == "submit" then
     local path = parts[2]
-    if not path then print("usage: submit <file.lua> [n|all] [jobName] [self]"); return end
+    if not path then printErr("usage: submit <file.lua> [n|all] [jobName] [self]"); return end
     local nodeCount = parts[3] or "all"
     if nodeCount ~= "all" then nodeCount = tonumber(nodeCount) or "all" end
     local jobName = parts[4] or fs.name(path)
@@ -529,8 +645,8 @@ local function handleCommand(line)
     for i = 3, #parts do if parts[i] == "self" then includeSelf = true end end
 
     local source, err = readFile(path)
-    if not source then print("Error: " .. err); return end
-    if not masterAddress then print("No master elected yet - try again shortly."); return end
+    if not source then printErr("Error: " .. err); return end
+    if not masterAddress then printWarn("No master elected yet - try again shortly."); return end
 
     local m = {type = "SUBMIT", jobName = jobName, source = source, nodeCount = nodeCount, includeSelf = includeSelf}
     if masterAddress == ID then
@@ -539,44 +655,116 @@ local function handleCommand(line)
     else
       send(masterAddress, m)
     end
-    print(("Submitted '%s' to master %s (requesting %s node(s))"):format(jobName, masterAddress:sub(1, 8), tostring(nodeCount)))
+    printOk(("Submitted '%s' to master %s (requesting %s node(s))"):format(jobName, masterAddress:sub(1, 8), tostring(nodeCount)))
 
   elseif cmd == "nodes" then
-    print(("%-10s %-10s %-6s %-8s"):format("NAME", "ADDR", "PRI", "ROLE"))
-    local tag = (masterAddress == ID) and "  (you, MASTER)" or "  (you)"
-    print(("%-10s %-10s %-6d %-8s"):format(NAME, ID:sub(1, 8), MY_PRIORITY, role) .. tag)
-    for addr, info in pairs(peers) do
-      local isMaster = (addr == masterAddress) and "  (MASTER)" or ""
-      print(("%-10s %-10s %-6s %-8s"):format(tostring(info.name), addr:sub(1, 8), tostring(info.priority), tostring(info.role)) .. isMaster)
+    local headers = {"NAME", "ADDR", "PRI", "ROLE", ""}
+    local rows = {}
+
+    table.insert(rows, {
+      NAME, ID:sub(1, 8), tostring(MY_PRIORITY), role:upper(),
+      (masterAddress == ID) and "you, MASTER" or "you",
+      rowColor = (masterAddress == ID) and COLORS.master or COLORS.worker,
+    })
+
+    local addrs = {}
+    for addr in pairs(peers) do table.insert(addrs, addr) end
+    table.sort(addrs)
+    for _, addr in ipairs(addrs) do
+      local info = peers[addr]
+      table.insert(rows, {
+        tostring(info.name), addr:sub(1, 8), tostring(info.priority),
+        tostring(info.role):upper(),
+        (addr == masterAddress) and "MASTER" or "",
+        rowColor = (addr == masterAddress) and COLORS.master or nil,
+      })
     end
 
+    drawTable(headers, rows)
+
   elseif cmd == "status" then
-    print("Role:        " .. role)
-    print("Master:      " .. (masterAddress and masterAddress:sub(1, 8) or "unknown (electing...)"))
-    print("Known peers: " .. tablen(peers))
-    if role == "master" then print("Active jobs: " .. tablen(jobs)) end
+    local function field(label, value, color)
+      fg(COLORS.muted); term.write(("%-13s"):format(label))
+      fg(color or COLORS.text); print(value)
+      resetColors()
+    end
+    field("Role:", role:upper(), (role == "master") and COLORS.master or COLORS.worker)
+    field("Master:", masterAddress and (masterAddress:sub(1, 8) .. ((masterAddress == ID) and " (you)" or "")) or "unknown (electing...)")
+    field("Known peers:", tostring(tablen(peers)))
+    if role == "master" then
+      field("Active jobs:", tostring(tablen(jobs)), (tablen(jobs) > 0) and COLORS.warn or nil)
+    end
 
   elseif cmd == "priority" then
     local p = tonumber(parts[2])
-    if not p then print("usage: priority <number>"); return end
+    if not p then printErr("usage: priority <number>"); return end
     MY_PRIORITY = p
-    print("Priority set to " .. p .. " (used from the next election onwards)")
+    printOk("Priority set to " .. p .. " (used from the next election onwards)")
 
   elseif cmd == "help" then
     print("commands:")
-    print("  submit <file.lua> [n|all] [jobName] [self]  - run a job across n nodes")
-    print("  nodes                                       - list known cluster nodes")
-    print("  status                                      - show this node's status")
-    print("  priority <n>                                - change master-election priority")
-    print("  quit                                         - exit")
+    local function cmdLine(name, desc)
+      fg(COLORS.accent); term.write("  " .. name)
+      fg(COLORS.muted); print(" - " .. desc)
+      resetColors()
+    end
+    cmdLine("submit <file.lua> [n|all] [jobName] [self]", "run a job across n nodes")
+    cmdLine("nodes", "list known cluster nodes")
+    cmdLine("status", "show this node's status")
+    cmdLine("priority <n>", "change master-election priority")
+    cmdLine("quit", "exit")
 
   elseif cmd == "quit" or cmd == "exit" then
     print("bye")
     os.exit()
 
   else
-    print("unknown command '" .. cmd .. "' - type 'help'")
+    printErr("unknown command '" .. cmd .. "' - type 'help'")
   end
+end
+
+-------------------------------------------------------------------------
+-- Status bar
+--
+-- Row 1 of the screen is repainted every loop tick (at least twice a
+-- second) with a compact live summary: role, name, address, priority,
+-- known peers, current master, and (if we are master) active job count.
+-- This isn't a hard-reserved viewport - ordinary scrolling output can
+-- still pass through row 1 between repaints - but since the loop ticks
+-- at worst every 0.5s, the bar stays effectively live even sitting idle.
+-------------------------------------------------------------------------
+
+local function drawStatusBar()
+  if not hasColor then return end
+  local w = (gpu.getResolution())
+  local cx, cy = term.getCursor()
+
+  local roleTxt = role:upper()
+  local roleColor = (role == "master") and COLORS.master or COLORS.worker
+  local info = ("  %s (%s)  pri:%d  peers:%d  master:%s%s  %s "):format(
+    NAME, ID:sub(1, 8), MY_PRIORITY, tablen(peers),
+    masterAddress and masterAddress:sub(1, 8) or "electing...",
+    (role == "master") and ("  jobs:" .. tablen(jobs)) or "",
+    os.date("%H:%M:%S"))
+
+  gpu.setBackground(COLORS.bar_bg)
+  gpu.fill(1, 1, w, 1, " ")
+
+  gpu.setForeground(roleColor)
+  gpu.set(1, 1, " " .. roleTxt)
+
+  local afterRole = 3 + unicode.len(roleTxt)
+  if afterRole <= w then
+    gpu.setForeground(COLORS.bar_fg)
+    local text = info
+    if afterRole + unicode.len(text) - 1 > w then
+      text = unicode.sub(text, 1, w - afterRole + 1)
+    end
+    gpu.set(afterRole, 1, text)
+  end
+
+  resetColors()
+  term.setCursor(cx, cy)
 end
 
 -------------------------------------------------------------------------
@@ -592,13 +780,28 @@ end
 local inputBuffer = ""
 local PROMPT = "cluster> "
 
-local function redrawPrompt()
-  term.write("\r" .. PROMPT .. inputBuffer .. string.rep(" ", 4) .. "\r" .. PROMPT .. inputBuffer)
+local function writePrompt()
+  fg(COLORS.accent)
+  term.write(PROMPT)
+  resetColors()
 end
 
+local function redrawPrompt()
+  term.write("\r")
+  writePrompt()
+  term.write(inputBuffer .. string.rep(" ", 4) .. "\r")
+  writePrompt()
+  term.write(inputBuffer)
+end
+
+fg(COLORS.accent)
 print(("cluster_node starting - id=%s name=%s priority=%d port=%d"):format(ID:sub(1, 8), NAME, MY_PRIORITY, PORT))
+resetColors()
+fg(COLORS.muted)
 print("type 'help' for commands")
-term.write(PROMPT)
+resetColors()
+drawStatusBar()
+writePrompt()
 
 while true do
   local e, p1, p2, p3, p4, p5 = event.pull(0.5)
@@ -620,7 +823,7 @@ while true do
       local line = inputBuffer
       inputBuffer = ""
       handleCommand(line)
-      term.write(PROMPT)
+      writePrompt()
     elseif code == keyboard.keys.back then
       if #inputBuffer > 0 then
         inputBuffer = inputBuffer:sub(1, -2)
@@ -657,7 +860,7 @@ while true do
   end
 
   if role == "worker" and masterAddress and now - lastHeartbeatRecv > HEARTBEAT_TIMEOUT then
-    log("Lost contact with master %s - starting new election", masterAddress:sub(1, 8))
+    log("warn", "Lost contact with master %s - starting new election", masterAddress:sub(1, 8))
     masterAddress, masterPriority = nil, nil
     startElection()
   end
@@ -672,7 +875,7 @@ while true do
       role, masterAddress, masterPriority = "master", ID, MY_PRIORITY
       lastHeartbeatSent = 0
       broadcastMsg({type = "COORDINATOR", master = ID, priority = MY_PRIORITY})
-      log("Elected as MASTER (priority %d)", MY_PRIORITY)
+      log("master", "Elected as MASTER (priority %d)", MY_PRIORITY)
     else
       pendingCoordinatorDeadline = now + COORDINATOR_WAIT
     end
@@ -682,4 +885,6 @@ while true do
     pendingCoordinatorDeadline = nil
     startElection()
   end
+
+  drawStatusBar()
 end
