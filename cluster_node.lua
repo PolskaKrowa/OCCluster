@@ -579,7 +579,38 @@ end
 -- Console
 -------------------------------------------------------------------------
 
+-- Current working directory for the console, independent of whatever
+-- directory the OpenComputers shell that launched us was in. Starts at
+-- root; "cd" moves it around and relative paths (submit, cd itself) are
+-- resolved against it via resolvePath below.
+local cwd = "/"
+
+-- Resolves `path` against `cwd` the way a normal shell would:
+--   * absolute paths (leading "/") are used as-is
+--   * "." and ".." segments are collapsed
+--   * the result is always an absolute, canonical path
+-- This does not touch the filesystem or require the path to exist -
+-- callers that need existence should check separately (fs.exists etc).
+local function resolvePath(path)
+  path = path or ""
+  local base = (path:sub(1, 1) == "/") and "" or cwd
+
+  local segments = {}
+  for seg in (base .. "/" .. path):gmatch("[^/]+") do
+    if seg == "." or seg == "" then
+      -- skip
+    elseif seg == ".." then
+      if #segments > 0 then table.remove(segments) end
+    else
+      table.insert(segments, seg)
+    end
+  end
+
+  return "/" .. table.concat(segments, "/")
+end
+
 local function readFile(path)
+  path = resolvePath(path)
   if not fs.exists(path) then return nil, "file not found: " .. path end
   local f, err = io.open(path, "r")
   if not f then return nil, err end
@@ -701,6 +732,21 @@ local function handleCommand(line)
     MY_PRIORITY = p
     printOk("Priority set to " .. p .. " (used from the next election onwards)")
 
+  elseif cmd == "cd" then
+    local target = parts[2] or "/"
+    local resolved = resolvePath(target)
+    if not fs.exists(resolved) then
+      printErr("cd: no such directory: " .. resolved)
+    elseif not fs.isDirectory(resolved) then
+      printErr("cd: not a directory: " .. resolved)
+    else
+      cwd = resolved
+      printOk(cwd)
+    end
+
+  elseif cmd == "pwd" then
+    print(cwd)
+
   elseif cmd == "help" then
     print("commands:")
     local function cmdLine(name, desc)
@@ -712,6 +758,8 @@ local function handleCommand(line)
     cmdLine("nodes", "list known cluster nodes")
     cmdLine("status", "show this node's status")
     cmdLine("priority <n>", "change master-election priority")
+    cmdLine("cd <path>", "change current directory (supports . and ..)")
+    cmdLine("pwd", "print current directory")
     cmdLine("quit", "exit")
 
   elseif cmd == "quit" or cmd == "exit" then
@@ -780,6 +828,15 @@ end
 local inputBuffer = ""
 local PROMPT = "cluster> "
 
+-- Command names that take a file path as their first argument, and
+-- whether that argument should be restricted to directories only.
+local PATH_COMMANDS = {
+  submit = {dirsOnly = false},
+  cd     = {dirsOnly = true},
+}
+
+local COMMAND_NAMES = {"submit", "nodes", "status", "priority", "cd", "pwd", "help", "quit", "exit"}
+
 local function writePrompt()
   fg(COLORS.accent)
   term.write(PROMPT)
@@ -792,6 +849,134 @@ local function redrawPrompt()
   term.write(inputBuffer .. string.rep(" ", 4) .. "\r")
   writePrompt()
   term.write(inputBuffer)
+end
+
+-- Longest common prefix of a list of strings (case-sensitive), or "" if
+-- the list is empty. Used to fill in as much of a completion as every
+-- candidate agrees on, the same way shell tab-completion behaves.
+local function commonPrefix(strings)
+  if #strings == 0 then return "" end
+  local prefix = strings[1]
+  for i = 2, #strings do
+    local s = strings[i]
+    local maxLen = math.min(#prefix, #s)
+    local j = 0
+    while j < maxLen and prefix:byte(j + 1) == s:byte(j + 1) do j = j + 1 end
+    prefix = prefix:sub(1, j)
+    if prefix == "" then break end
+  end
+  return prefix
+end
+
+-- Splits a path into (directory-to-list, partial-name-being-typed),
+-- both suitable for feeding into fs.list()/resolvePath(). Handles
+-- relative paths via cwd through resolvePath, and always returns a
+-- directory that ends in "/" for display purposes.
+local function splitPathForCompletion(partial)
+  partial = partial or ""
+  local dirPart, namePart = partial:match("^(.*)/([^/]*)$")
+  if not dirPart then
+    dirPart, namePart = "", partial
+  end
+  if dirPart == "" then
+    dirPart = partial:sub(1, 1) == "/" and "/" or "."
+  end
+
+  local resolvedDir = resolvePath(dirPart)
+  if resolvedDir ~= "/" then resolvedDir = resolvedDir .. "/" end
+  return resolvedDir, namePart
+end
+
+-- Returns the list of candidate completions (bare names, directories
+-- suffixed with "/") for `partial`, restricted to directories only if
+-- `dirsOnly` is set.
+local function completePath(partial, dirsOnly)
+  local resolvedDir, namePart = splitPathForCompletion(partial)
+  if not fs.exists(resolvedDir) or not fs.isDirectory(resolvedDir) then
+    return {}, ""
+  end
+
+  local matches = {}
+  for entry in fs.list(resolvedDir) do
+    local name = entry:gsub("/$", "")
+    if name:sub(1, #namePart) == namePart then
+      local isDir = entry:sub(-1) == "/"
+      if isDir or not dirsOnly then
+        table.insert(matches, name .. (isDir and "/" or ""))
+      end
+    end
+  end
+  table.sort(matches)
+  return matches, namePart
+end
+
+-- Attempts to complete the word under the cursor at the end of
+-- inputBuffer (command name if it's the first word, else a file path
+-- for commands in PATH_COMMANDS). Mutates inputBuffer in place and
+-- prints an ambiguous-match list when more than one candidate remains,
+-- mirroring familiar shell tab-completion behaviour.
+local function attemptAutocomplete()
+  local hasTrailingSpace = inputBuffer:match("%s$") ~= nil
+  local parts = {}
+  for w in inputBuffer:gmatch("%S+") do table.insert(parts, w) end
+
+  local isFirstWord = (#parts == 0) or (#parts == 1 and not hasTrailingSpace)
+
+  if isFirstWord then
+    local partial = parts[1] or ""
+    local matches = {}
+    for _, name in ipairs(COMMAND_NAMES) do
+      if name:sub(1, #partial) == partial then table.insert(matches, name) end
+    end
+    table.sort(matches)
+
+    if #matches == 0 then
+      return
+    elseif #matches == 1 then
+      inputBuffer = matches[1] .. " "
+      redrawPrompt()
+    else
+      local prefix = commonPrefix(matches)
+      if #prefix > #partial then
+        inputBuffer = prefix
+        redrawPrompt()
+      else
+        term.write("\n")
+        print(table.concat(matches, "  "))
+        writePrompt()
+        term.write(inputBuffer)
+      end
+    end
+    return
+  end
+
+  -- Completing an argument: only meaningful for commands that take a path.
+  local cmd = parts[1]
+  local spec = PATH_COMMANDS[cmd]
+  if not spec then return end
+
+  local partial = hasTrailingSpace and "" or parts[#parts]
+  local matches, namePart = completePath(partial, spec.dirsOnly)
+
+  if #matches == 0 then
+    return
+  elseif #matches == 1 then
+    local dirPart = partial:match("^(.*/)[^/]*$") or ""
+    inputBuffer = inputBuffer:sub(1, #inputBuffer - #partial) .. dirPart .. matches[1]
+    redrawPrompt()
+  else
+    local prefix = commonPrefix(matches)
+    if #prefix > #namePart then
+      local dirPart = partial:match("^(.*/)[^/]*$") or ""
+      inputBuffer = inputBuffer:sub(1, #inputBuffer - #partial) .. dirPart .. prefix
+      redrawPrompt()
+    else
+      term.write("\n")
+      print(table.concat(matches, "  "))
+      writePrompt()
+      term.write(inputBuffer)
+    end
+  end
 end
 
 fg(COLORS.accent)
@@ -829,6 +1014,8 @@ while true do
         inputBuffer = inputBuffer:sub(1, -2)
         redrawPrompt()
       end
+    elseif code == keyboard.keys.tab then
+      attemptAutocomplete()
     elseif char and char > 31 then
       inputBuffer = inputBuffer .. unicode.char(char)
       term.write(unicode.char(char))
