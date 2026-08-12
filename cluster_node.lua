@@ -10,6 +10,10 @@
 --   * running user-supplied Lua job scripts and giving them a small
 --     MPI-style API (rank/size/send/recv/broadcast/scatter/gather/barrier)
 --     for talking to each other while a job is running
+--   * transparently splitting any outgoing message that would exceed
+--     OpenComputers' network packet size limit (job source being
+--     dispatched, gathered/broadcast results, etc.) into multiple
+--     packets, and reassembling them on the receiving end
 --
 -- See README.md for usage instructions and examples/ for sample jobs.
 
@@ -34,7 +38,7 @@ local gpu   = component.gpu
 -------------------------------------------------------------------------
 
 local CFG_PATH = "/etc/cluster.cfg"
-local cfg = {port = 4210, priority = 50, name = nil}
+local cfg = {port = 4210, priority = 50, name = nil, maxPacketSize = 8192}
 
 if fs.exists(CFG_PATH) then
   local f = io.open(CFG_PATH, "r")
@@ -56,6 +60,8 @@ for i = 1, #args do
     cfg.name = args[i + 1]
   elseif args[i] == "--port" and args[i + 1] then
     cfg.port = tonumber(args[i + 1])
+  elseif args[i] == "--max-packet-size" and args[i + 1] then
+    cfg.maxPacketSize = tonumber(args[i + 1])
   end
 end
 
@@ -76,6 +82,24 @@ local HEARTBEAT_INTERVAL = 2
 local HEARTBEAT_TIMEOUT  = 6
 local ELECTION_WINDOW    = 1.5
 local COORDINATOR_WAIT   = 3
+
+-- How long a partially-received chunked message is kept around waiting
+-- for its remaining pieces before being given up on and discarded. This
+-- only matters if a chunk gets lost outright (dropped packet, sender
+-- went away mid-send, etc.) - normal reassembly completes in well under
+-- a second.
+local CHUNK_BUFFER_TIMEOUT = 20
+
+-- OpenComputers rejects any single modem.send/modem.broadcast whose
+-- combined argument size exceeds the network's packet size limit
+-- (server-configurable via maxNetworkPacketSize, 8192 by default - see
+-- --max-packet-size / cfg.maxPacketSize above if yours differs). Rather
+-- than let large messages (job source, gathered results, ...) simply
+-- fail to send, everything is transparently chunked below this ceiling.
+-- CHUNK_HEADROOM reserves space for the small non-payload arguments
+-- ("__CHUNK", id, seq, total) each chunk packet also carries.
+local CHUNK_HEADROOM = 256
+local CHUNK_PAYLOAD  = math.max(1024, cfg.maxPacketSize - CHUNK_HEADROOM)
 
 -------------------------------------------------------------------------
 -- State
@@ -98,6 +122,12 @@ local lastHeartbeatRecv = 0
 
 local taskCounter = 0
 local jobs = {} -- master-side bookkeeping: [taskId] = {expected, got, results, requester, jobName, startTime}
+
+local chunkIdCounter = 0
+
+-- Incoming chunked messages that haven't fully arrived yet.
+-- [senderAddress .. ":" .. chunkId] = {parts = {[seq]=data,...}, total=, count=, lastSeen=}
+local chunkBuffers = {}
 
 -- ASSIGNs that arrived while this node was already busy executing a job.
 -- They cannot be run inline (the worker is synchronous and single-tasking),
@@ -181,14 +211,103 @@ local function log(level, fmt, ...)
   resetColors()
 end
 
+-------------------------------------------------------------------------
+-- Chunked transport
+--
+-- A logical message is always serialized to a single string first, same
+-- as before. If that string fits in one packet it is sent exactly as
+-- it always was (a single string argument), so small traffic (HELLO,
+-- HEARTBEAT, ELECTION, ...) is unaffected. If it doesn't fit, it's cut
+-- into CHUNK_PAYLOAD-sized pieces and sent as a short burst of packets
+-- tagged with a chunk id, sequence number, and total count - each piece
+-- is sent as a *raw* string argument (not re-serialized), so splitting
+-- never inflates the payload the way re-escaping an already-serialized
+-- string would. The receiving side buffers pieces per (sender, chunk
+-- id) until it has all of them, then concatenates and unserializes the
+-- original message, at which point it's handed to the caller exactly
+-- like any other message.
+-------------------------------------------------------------------------
+
+local function nextChunkId()
+  chunkIdCounter = chunkIdCounter + 1
+  return ID .. "-" .. chunkIdCounter
+end
+
+-- wireFn(...) sends its varargs as-is over the modem, already bound to
+-- either a unicast address or broadcast by the caller.
+local function sendChunked(wireFn, str)
+  if #str <= CHUNK_PAYLOAD then
+    wireFn(str)
+    return
+  end
+
+  local id = nextChunkId()
+  local total = math.ceil(#str / CHUNK_PAYLOAD)
+  for seq = 1, total do
+    local from = (seq - 1) * CHUNK_PAYLOAD + 1
+    local chunk = str:sub(from, from + CHUNK_PAYLOAD - 1)
+    wireFn("__CHUNK", id, seq, total, chunk)
+  end
+end
+
 local function send(address, msg)
   msg.from = ID
-  modem.send(address, PORT, serialization.serialize(msg))
+  sendChunked(function(...) modem.send(address, PORT, ...) end, serialization.serialize(msg))
 end
 
 local function broadcastMsg(msg)
   msg.from = ID
-  modem.broadcast(PORT, serialization.serialize(msg))
+  sendChunked(function(...) modem.broadcast(PORT, ...) end, serialization.serialize(msg))
+end
+
+-- Folds one arrived chunk into its buffer and, once every piece for
+-- that (sender, id) has shown up, concatenates and unserializes them
+-- back into the original message table. Returns nil while still
+-- waiting on more pieces.
+local function receiveChunk(senderAddr, id, seq, total, data)
+  local key = senderAddr .. ":" .. id
+  local buf = chunkBuffers[key]
+  if not buf then
+    buf = {parts = {}, total = total, count = 0}
+    chunkBuffers[key] = buf
+  end
+  if not buf.parts[seq] then
+    buf.parts[seq] = data
+    buf.count = buf.count + 1
+  end
+  buf.lastSeen = computer.uptime()
+
+  if buf.count < buf.total then return nil end
+  chunkBuffers[key] = nil
+
+  local pieces = {}
+  for i = 1, buf.total do pieces[i] = buf.parts[i] or "" end
+  local ok, msg = pcall(serialization.unserialize, table.concat(pieces))
+  if ok and type(msg) == "table" then return msg end
+  return nil
+end
+
+-- Discards chunk buffers that never completed (a lost packet, a sender
+-- that disappeared mid-send, ...) so they don't accumulate forever.
+local function cleanupChunkBuffers()
+  local now = computer.uptime()
+  for key, buf in pairs(chunkBuffers) do
+    if now - buf.lastSeen > CHUNK_BUFFER_TIMEOUT then chunkBuffers[key] = nil end
+  end
+end
+
+-- Turns the raw extra arguments of a modem_message event back into a
+-- logical message table, whether it arrived as a single packet or as a
+-- "__CHUNK" burst. Returns nil if the packet is on a different port,
+-- is one piece of a still-incomplete chunk burst, or fails to decode.
+local function decodeModemMessage(senderAddr, port, a1, a2, a3, a4, a5)
+  if port ~= PORT then return nil end
+  if a1 == "__CHUNK" then
+    return receiveChunk(senderAddr, a2, a3, a4, a5)
+  end
+  local ok, msg = pcall(serialization.unserialize, a1)
+  if ok and type(msg) == "table" then return msg end
+  return nil
 end
 
 local function newTaskId()
@@ -309,10 +428,10 @@ local function buildTaskAPI(taskId, rank, size, ranks, reportTo)
     while true do
       local remaining = deadline - computer.uptime()
       if remaining <= 0 then return nil, "timeout" end
-      local e, _, _, port, _, data = event.pull(remaining, "modem_message")
+      local e, _, senderAddr, port, _, a1, a2, a3, a4, a5 = event.pull(remaining, "modem_message")
       if e == "modem_message" and port == PORT then
-        local ok, msg = pcall(serialization.unserialize, data)
-        if ok and type(msg) == "table" then
+        local msg = decodeModemMessage(senderAddr, port, a1, a2, a3, a4, a5)
+        if msg then
           if msg.type == "TASK_MSG" and msg.taskId == taskId then
             if matches(msg, fromRank, tag) then
               return msg.payload, msg.fromRank
@@ -989,15 +1108,13 @@ drawStatusBar()
 writePrompt()
 
 while true do
-  local e, p1, p2, p3, p4, p5 = event.pull(0.5)
+  local e, p1, p2, p3, p4, p5, p6, p7, p8, p9 = event.pull(0.5)
 
   if e == "modem_message" then
-    local port, data = p3, p5
-    if port == PORT then
-      local ok, msg = pcall(serialization.unserialize, data)
-      if ok and type(msg) == "table" and msg.type and handlers[msg.type] then
-        handlers[msg.type](msg)
-      end
+    local senderAddr, port = p2, p3
+    local msg = decodeModemMessage(senderAddr, port, p5, p6, p7, p8, p9)
+    if msg and msg.type and handlers[msg.type] then
+      handlers[msg.type](msg)
     end
     redrawPrompt()
 
@@ -1039,6 +1156,7 @@ while true do
     for addr, info in pairs(peers) do
       if now - info.lastSeen > HELLO_EXPIRE then peers[addr] = nil end
     end
+    cleanupChunkBuffers()
   end
 
   if role == "master" and now - lastHeartbeatSent >= HEARTBEAT_INTERVAL then
