@@ -31,7 +31,7 @@ if not component.isAvailable("modem") then
   return
 end
 local modem = component.modem
-local gpu   = component.gpu
+local gpu   = component.isAvailable("gpu") and component.gpu or nil
 
 -------------------------------------------------------------------------
 -- Config
@@ -139,16 +139,74 @@ local pendingAssigns = {}
 -------------------------------------------------------------------------
 -- Colour / display helpers
 --
--- All colour is optional: on a tier 1 (monochrome) GPU every helper here
--- becomes a no-op and the program falls back to plain text, exactly as
--- before. On tier 2/3 we theme log levels, tables, and a small live
--- status bar pinned to the top of the screen.
+-- All colour is optional: on a tier 1 (monochrome) GPU, or with no GPU/
+-- screen at all, every helper here becomes a no-op and the program
+-- falls back to running silently (headless). On tier 2/3 we theme log
+-- levels, tables, and a small live status bar pinned to the top of the
+-- screen.
+--
+-- This node is meant to run unattended on rack-mounted blades that may
+-- have no screen wired up at all, and a screen that IS attached can be
+-- unplugged at any moment (a screen removed from a running computer
+-- doesn't stop the computer - it just leaves the gpu unbound). Every
+-- actual call into gpu/term/print below is therefore pcall-guarded so a
+-- vanished or absent display degrades to "nothing gets drawn" instead
+-- of an uncaught error killing the whole node - a bad screen shouldn't
+-- be able to take a cluster node out from under a running job. Because
+-- these are per-call guards rather than a permanent "display is dead"
+-- flag, a screen that's plugged back in later starts working again on
+-- its own, with no restart needed.
 -------------------------------------------------------------------------
 
-local hasColor = gpu.getDepth() > 1
+-- Swallows errors from a single GPU call. Returns true plus any results
+-- on success, or just false if the GPU is missing or the call failed
+-- (no bound screen, screen ripped out mid-call, etc.).
+local function safeGpu(fn, ...)
+  if not gpu then return false end
+  local ok, a, b = pcall(fn, ...)
+  if not ok then return false end
+  return true, a, b
+end
 
-local defaultFg, defaultFgPalette = gpu.getForeground()
-local defaultBg, defaultBgPalette = gpu.getBackground()
+local hasColorOk, depth = safeGpu(gpu and gpu.getDepth)
+local hasColor = hasColorOk and depth ~= nil and depth > 1
+
+local defaultFg, defaultFgPalette
+local defaultBg, defaultBgPalette
+do
+  local ok, a, b = safeGpu(gpu and gpu.getForeground)
+  if ok then defaultFg, defaultFgPalette = a, b end
+end
+do
+  local ok, a, b = safeGpu(gpu and gpu.getBackground)
+  if ok then defaultBg, defaultBgPalette = a, b end
+end
+
+-- Shadows the global print() for the rest of this file (lexical
+-- scoping means every later bare print(...) call automatically picks
+-- this one up) so that scattered console output can't crash the
+-- daemon if the terminal it writes to has lost its screen.
+local rawPrint = print
+local function print(...)
+  pcall(rawPrint, ...)
+end
+
+-- Same idea for term.write/getCursor/setCursor: `term` is already a
+-- local (from require("term") above), so replacing it here changes
+-- what every later term.* call in this file resolves to, without ever
+-- touching the shared global term module other programs may rely on.
+do
+  local rawTerm = term
+  term = setmetatable({
+    write = function(...) return (pcall(rawTerm.write, ...)) end,
+    getCursor = function()
+      local ok, x, y = pcall(rawTerm.getCursor)
+      if ok then return x, y end
+      return 1, 1
+    end,
+    setCursor = function(...) pcall(rawTerm.setCursor, ...) end,
+  }, {__index = rawTerm})
+end
 
 local COLORS = {
   text    = 0xE6E6E6,
@@ -171,13 +229,13 @@ local function rankColor(rank)
 end
 
 local function fg(color)
-  if hasColor and color then gpu.setForeground(color) end
+  if hasColor and color then safeGpu(gpu.setForeground, color) end
 end
 
 local function resetColors()
   if not hasColor then return end
-  gpu.setForeground(defaultFg, defaultFgPalette)
-  gpu.setBackground(defaultBg, defaultBgPalette)
+  safeGpu(gpu.setForeground, defaultFg, defaultFgPalette)
+  safeGpu(gpu.setBackground, defaultBg, defaultBgPalette)
 end
 
 local function printColor(color, msg)
@@ -903,7 +961,9 @@ end
 
 local function drawStatusBar()
   if not hasColor then return end
-  local w = (gpu.getResolution())
+
+  local ok, w = safeGpu(gpu.getResolution)
+  if not ok or not w then return end
   local cx, cy = term.getCursor()
 
   local roleTxt = role:upper()
@@ -914,20 +974,20 @@ local function drawStatusBar()
     (role == "master") and ("  jobs:" .. tablen(jobs)) or "",
     os.date("%H:%M:%S"))
 
-  gpu.setBackground(COLORS.bar_bg)
-  gpu.fill(1, 1, w, 1, " ")
+  safeGpu(gpu.setBackground, COLORS.bar_bg)
+  safeGpu(gpu.fill, 1, 1, w, 1, " ")
 
-  gpu.setForeground(roleColor)
-  gpu.set(1, 1, " " .. roleTxt)
+  safeGpu(gpu.setForeground, roleColor)
+  safeGpu(gpu.set, 1, 1, " " .. roleTxt)
 
   local afterRole = 3 + unicode.len(roleTxt)
   if afterRole <= w then
-    gpu.setForeground(COLORS.bar_fg)
+    safeGpu(gpu.setForeground, COLORS.bar_fg)
     local text = info
     if afterRole + unicode.len(text) - 1 > w then
       text = unicode.sub(text, 1, w - afterRole + 1)
     end
-    gpu.set(afterRole, 1, text)
+    safeGpu(gpu.set, afterRole, 1, text)
   end
 
   resetColors()
